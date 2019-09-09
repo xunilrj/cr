@@ -432,6 +432,14 @@ struct cr_plugin;
 
 typedef int (*cr_plugin_main_func)(struct cr_plugin *ctx, enum cr_op operation);
 
+#ifndef CR_ANYFUNCTION_QTD
+    #define CR_ANYFUNCTION_QTD 8
+#endif
+#ifndef CR_ANYFUNCTION_NAMESSIZE
+    #define CR_ANYFUNCTION_NAMESSIZE 1024
+#endif
+
+
 // public interface for the plugin context, this has some user facing
 // variables that may be used to manage reload feedback.
 // - userdata may be used by the user to pass information between reloads
@@ -446,6 +454,11 @@ struct cr_plugin {
     enum cr_failure failure;
     unsigned int next_version;
     unsigned int last_working_version;
+
+    #ifdef CR_ANYFUNCTION
+        char fnames[CR_ANYFUNCTION_NAMESSIZE];
+        void* ftable[CR_ANYFUNCTION_QTD];
+    #endif
 };
 
 #ifndef CR_HOST
@@ -1069,14 +1082,15 @@ static so_handle cr_so_load(const std::string &filename) {
     return new_dll;
 }
 
-static cr_plugin_main_func cr_so_symbol(so_handle handle) {
+static void* cr_so_symbol(so_handle handle, const char* name = CR_MAIN_FUNC) {
     CR_ASSERT(handle);
-    auto new_main = (cr_plugin_main_func)GetProcAddress(handle, CR_MAIN_FUNC);
-    if (!new_main) {
-        CR_ERROR("Couldn't find plugin entry point: %d\n",
+    auto f = GetProcAddress(handle, name);
+    if (!f) {
+        CR_ERROR("Couldn't find plugin function [%d]: %d\n",
+                name,
                 GetLastError());
     }
-    return new_main;
+    return f;
 }
 
 static void cr_plat_init() {
@@ -1536,14 +1550,16 @@ static so_handle cr_so_load(const std::string &new_file) {
     return new_dll;
 }
 
-static cr_plugin_main_func cr_so_symbol(so_handle handle) {
+static void* cr_so_symbol(so_handle handle, const char* name = CR_MAIN_FUNC) {
     CR_ASSERT(handle);
     dlerror();
-    auto new_main = (cr_plugin_main_func)dlsym(handle, CR_MAIN_FUNC);
-    if (!new_main) {
-        CR_ERROR("Couldn't find plugin entry point: %s\n", dlerror());
+    auto f = dlsym(handle, name);
+    if (!f) {
+        CR_ERROR("Couldn't find plugin function [%d]: %d\n",
+                name,
+                dlerror());
     }
-    return new_main;
+    return f;
 }
 
 sigjmp_buf env;
@@ -1668,10 +1684,24 @@ static bool cr_plugin_load_internal(cr_plugin &ctx, bool rollback) {
             cr_plugin_sections_reload(ctx, cr_plugin_section_version::current);
         }
 
-        auto new_main = cr_so_symbol(new_dll);
+        auto new_main = (cr_plugin_main_func) cr_so_symbol(new_dll);
         if (!new_main) {
             return false;
         }
+
+        #ifdef CR_ANYFUNCTION
+
+        char* symbolName = ctx.fnames;
+        unsigned int fi = 0;
+        while(*symbolName != 0 && fi < CR_ANYFUNCTION_QTD)
+        {
+            ctx.ftable[fi] = cr_so_symbol(new_dll, symbolName);
+            while(*symbolName != 0) ++symbolName;
+            ++symbolName;
+            ++fi;
+        }
+
+        #endif
 
         auto p2 = (cr_internal *)ctx.p;
         p2->handle = new_dll;
@@ -1900,6 +1930,8 @@ extern "C" int cr_plugin_update(cr_plugin &ctx, bool reloadCheck = true) {
     return r;
 }
 
+
+
 // Loads a plugin from the specified full path (or current directory if NULL).
 extern "C" bool cr_plugin_load(cr_plugin &ctx, const char *fullpath) {
     CR_TRACE
@@ -1942,6 +1974,91 @@ extern "C" void cr_plugin_close(cr_plugin &ctx) {
     ctx.p = nullptr;
     ctx.version = 0;
 }
+
+#ifdef CR_ANYFUNCTION
+
+// This code will call and return the value
+// of exported function "f1":
+// cr_plugin_load(plugin, "c:/game.dll");
+// cr_plugin_load_functions(plugin, "f1,f2,f3");
+// auto f = (void(*)(double))cr_plugin_get_function(plugin, 0);
+// auto r = f(1.0f);
+extern "C" bool cr_plugin_load_functions(cr_plugin &ctx, const char *functions, char separator = ',')
+{
+    CR_TRACE
+
+    size_t l = strlen(functions);
+    size_t m = min(l, CR_ANYFUNCTION_NAMESSIZE - 2);
+
+    CR_ASSERT(l <= (CR_ANYFUNCTION_NAMESSIZE - 2));
+    if(l > (CR_ANYFUNCTION_NAMESSIZE - 2)) return false;
+
+    const char * from = functions;
+    char * to = ctx.fnames;
+    while(*from != 0 && (m >= 0))
+    {
+        if(*from == separator) *to = 0;
+        else *to = *from;
+        ++from; ++to; --m;
+    }
+    *to = 0; ++to;
+    *to = 0;
+    return true;
+}
+
+extern "C" void* cr_plugin_get_function(cr_plugin &ctx, unsigned int i)
+{
+    CR_TRACE
+    CR_ASSERT(i < CR_ANYFUNCTION_QTD);
+    if(i >= CR_ANYFUNCTION_QTD) return 0;
+    return ctx.ftable[i];
+}
+
+#endif
+
+#ifdef CR_ANYFUNCTION
+    #ifdef CR_CPP
+        #include <optional>
+        #include <type_traits>
+
+        template <typename T>
+        using cr_optional = std::optional<
+            typename std::conditional<std::is_void<T>::value,
+            bool,
+            T>::type 
+        >;
+
+        // This code will call and return the value
+        // of exported function "f1":
+        // cr_plugin_load(plugin, "c:/game.dll");
+        // cr_plugin_load_functions(plugin, "f1,f2,f3");
+        // auto r = cr_plugin_call<double>(plugin, 0, 1.0f);
+        template <typename TR = void, typename... TArgs>
+        cr_optional<TR> cr_plugin_call(cr_plugin &ctx, unsigned int i, TArgs... args)
+        {
+            CR_TRACE
+            CR_ASSERT((i < CR_ANYFUNCTION_QTD));
+            if((i >= CR_ANYFUNCTION_QTD)) return {};
+
+#ifndef __MINGW32__
+    __try {
+#endif
+            auto* f = (TR (*)(TArgs...))ctx.ftable[i];
+            if (f) {
+                if constexpr(std::is_void<TR>::value) {
+                    f(args...);
+                    return {true};
+                } else 
+                    return {f(args...)};
+            }
+#ifndef __MINGW32__
+    } __except (cr_seh_filter(ctx, GetExceptionCode())) {
+    }
+#endif
+            return {};
+        }
+    #endif
+#endif 
 
 #endif // #ifndef CR_HOST
 
